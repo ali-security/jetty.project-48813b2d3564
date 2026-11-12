@@ -1,0 +1,194 @@
+# Authored by agentic-sealer: upstream Jetty 9.2.x has no GitHub Actions CI (it builds on
+# Jenkins, see Jenkinsfile: JDK 7 + `mvn -B clean install`). This workflow mirrors that
+# build on JDK 7 for the jetty-http module and the modules whose tests cover the CVE paths.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      MAVEN_OPTS: "-Xms256m -Xmx2g -XX:MaxPermSize=512m -Djava.awt.headless=true -Dhttps.protocols=TLSv1.2"
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+
+      # actions/setup-java no longer lists Zulu 7, so fetch the last Zulu 7 build directly.
+      - name: Set up JDK 7 (release Build-Jdk is 1.7.0_75)
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/jdk7"
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$RUNNER_TEMP/jdk7.tgz" \
+            https://cdn.azul.com/zulu/bin/zulu7.56.0.11-ca-jdk7.0.352-linux_x64.tar.gz
+          tar xzf "$RUNNER_TEMP/jdk7.tgz" -C "$RUNNER_TEMP/jdk7" --strip-components=1
+          echo "JAVA_HOME=$RUNNER_TEMP/jdk7" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/jdk7/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/jdk7/bin/java" -version
+
+      # Zulu 7u352 disables MD5withRSA certificates and TLSv1, but the jetty test keystores are
+      # MD5withRSA 1024-bit certs and several SSL tests use TLSv1. Restore the crypto policy of
+      # the JDK the release was built with (1.7.0_75) so the SSL tests run as they did upstream.
+      - name: Restore JDK 7u75 crypto policy
+        shell: python
+        run: |
+          import os, re
+          p = os.path.join(os.environ["RUNNER_TEMP"], "jdk7", "jre", "lib", "security", "java.security")
+          lines = open(p).read().split("\n")
+          out, skip = [], False
+          for line in lines:
+              if skip:
+                  skip = line.rstrip().endswith("\\")
+                  continue
+              m = re.match(r"^(jdk\.certpath\.disabledAlgorithms|jdk\.tls\.disabledAlgorithms)\s*=", line)
+              if m:
+                  skip = line.rstrip().endswith("\\")
+                  out.append({"jdk.certpath.disabledAlgorithms": "jdk.certpath.disabledAlgorithms=MD2, RSA keySize < 1024",
+                              "jdk.tls.disabledAlgorithms": "jdk.tls.disabledAlgorithms=SSLv3"}[m.group(1)])
+                  continue
+              out.append(line)
+          open(p, "w").write("\n".join(out))
+          for line in out:
+              if "disabledAlgorithms=" in line and not line.startswith("#"):
+                  print(line)
+
+      - name: Install Maven 3.8.8
+        run: |
+          set -e
+          cd "$RUNNER_TEMP"
+          for URL in https://repo1.maven.org/maven2/org/apache/maven/apache-maven/3.8.8/apache-maven-3.8.8-bin.tar.gz \
+                     https://archive.apache.org/dist/maven/maven-3/3.8.8/binaries/apache-maven-3.8.8-bin.tar.gz; do
+            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o maven.tgz "$URL" && break
+          done
+          tar xzf maven.tgz
+          # jetty-version-maven-plugin needs artifacts only on repo.jenkins-ci.org; route all
+          # other repositories (some poms still declare http:// URLs) to Maven Central over https.
+          cat > apache-maven-3.8.8/conf/settings.xml <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-https</id>
+                <mirrorOf>*,!jenkins-ci</mirrorOf>
+                <url>https://repo1.maven.org/maven2</url>
+              </mirror>
+            </mirrors>
+            <profiles>
+              <profile>
+                <id>jenkins</id>
+                <repositories>
+                  <repository><id>jenkins-ci</id><url>https://repo.jenkins-ci.org/public/</url></repository>
+                </repositories>
+                <pluginRepositories>
+                  <pluginRepository><id>jenkins-ci</id><url>https://repo.jenkins-ci.org/public/</url></pluginRepository>
+                </pluginRepositories>
+              </profile>
+            </profiles>
+            <activeProfiles><activeProfile>jenkins</activeProfile></activeProfiles>
+          </settings>
+          EOF
+          echo "$RUNNER_TEMP/apache-maven-3.8.8/bin" >> "$GITHUB_PATH"
+
+      # Full suites of jetty-util, jetty-io, jetty-http, jetty-xml, jetty-jmx and jetty-server:
+      # the patched HttpParser/HttpURI are exercised throughout jetty-server.
+      - name: Build jetty-http and run the full jetty-util/io/http/server suites
+        if: ${{ inputs.test-filter == '' }}
+        run: mvn -B -V -e -ntp clean install -pl jetty-http,jetty-server -am
+
+      - name: Stage release artifacts
+        if: ${{ inputs.test-filter == '' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cp jetty-http/target/jetty-http-9.2.24.v20180105.jar jetty-http/target/jetty-http-9.2.24.v20180105-tests.jar "$RUNNER_TEMP/out/"
+          ls -l "$RUNNER_TEMP/out"
+
+      - name: Test CVE-patched paths in jetty-client and jetty-proxy
+        if: ${{ inputs.test-filter == '' }}
+        run: >-
+          mvn -B -V -e -ntp install -pl jetty-client,jetty-proxy -am
+          -Dtest=HttpClientURITest,HttpClientLoadTest,ConnectHandlerTest,ConnectHandlerSSLTest,ProxyTunnellingTest,ProxyServletTest
+          -DfailIfNoTests=false
+
+      - name: Test CVE-patched paths in tests/test-integration (RFC2616)
+        if: ${{ inputs.test-filter == '' }}
+        run: >-
+          mvn -B -V -e -ntp install
+          -pl tests/test-webapps/test-webapp-rfc2616,tests/test-webapps/test-jetty-webapp,tests/test-webapps/test-proxy-webapp,tests/test-integration
+          -Dtest=RFC2616NIOHttpTest,RFC2616NIOHttpsTest
+          -DfailIfNoTests=false
+
+      - name: Run selected tests
+        if: ${{ inputs.test-filter != '' }}
+        run: |
+          mvn -B -V -e -ntp clean install -pl jetty-http,jetty-server,jetty-client,jetty-proxy -am \
+            -Dtest='${{ inputs.test-filter }}' -DfailIfNoTests=false
+          mkdir -p "$RUNNER_TEMP/out"
+          cp jetty-http/target/jetty-http-9.2.24.v20180105.jar jetty-http/target/jetty-http-9.2.24.v20180105-tests.jar "$RUNNER_TEMP/out/"
+
+      - name: Surefire results summary (per-class counts and skipped tests with reasons)
+        if: always()
+        shell: python
+        run: |
+          import glob, os, re, xml.etree.ElementTree as ET
+          # Surefire records no message for bare @Ignore / Assume skips (and only a placeholder for
+          # some @Ignore("...") values), so the reason is read from the test source as well.
+          OVERRIDE = {
+              "LazyListTest": "assumeTrue(STRICT) with STRICT=false in the test class",
+              "PathResourceTest": "class-level @Ignore (\"not utilized in 9.2\")",
+              "ResourceTest": "UNC path test only runs on Windows (assume OS.IS_WINDOWS)",
+              "RFC2616NIOHttpsTest": "class-level @Ignore upstream: the HTTPS variant of the RFC2616 suite was never finished",
+          }
+          srcs = {}
+          for f in glob.glob("**/src/test/java/**/*.java", recursive=True):
+              srcs.setdefault(os.path.basename(f)[:-5], []).append(f)
+          def source_reason(cls, name):
+              simple = cls.split(".")[-1].split("$")[0]
+              name = re.sub(r"\[.*\]$", "", name or "")
+              for f in srcs.get(simple, []):
+                  lines = open(f, errors="replace").read().split("\n")
+                  for i, l in enumerate(lines):
+                      if re.search(r"\b(public\s+)?void\s+" + re.escape(name) + r"\s*\(", l):
+                          ann = [x.strip() for x in lines[max(0, i - 6):i] if x.strip().startswith(("@Ignore", "@Stress", "@Slow", "//"))]
+                          body = [x.strip() for x in lines[i:i + 15] if "assume" in x.lower()]
+                          if ann or body:
+                              return "; ".join(ann + body[:2])
+                  cl = [x.strip() for x in lines if x.strip().startswith(("@Ignore", "@RunWith"))]
+                  if cl:
+                      return "class-level: " + "; ".join(cl)
+              return None
+          tot = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          skipped = []
+          for f in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              r = ET.parse(f).getroot()
+              c = {k: int(r.get(k, 0)) for k in tot}
+              for k in tot:
+                  tot[k] += c[k]
+              print("%-80s tests=%d failures=%d errors=%d skipped=%d" % (r.get("name"), c["tests"], c["failures"], c["errors"], c["skipped"]))
+              for tc in r.iter("testcase"):
+                  s = tc.find("skipped")
+                  if s is not None:
+                      cls = tc.get("classname", "") or r.get("name", "")
+                      simple = cls.split(".")[-1]
+                      msg = OVERRIDE.get(simple) or source_reason(cls, tc.get("name")) or s.get("message") \
+                          or "@Ignore/Assume without message"
+                      if "@Stress" in msg:
+                          msg += " (stress tests only run with -Dtest.stress=true)"
+                      skipped.append("%s#%s: %s" % (cls, tc.get("name"), msg))
+          print("\nSKIPPED TESTS (%d):" % len(skipped))
+          for s in skipped:
+              print("  SKIP-REASON " + s)
+          print("\nTOTAL: Tests run: %(tests)d, Failures: %(failures)d, Errors: %(errors)d, Skipped: %(skipped)d" % tot)
+          print("PASSED: %d" % (tot["tests"] - tot["failures"] - tot["errors"] - tot["skipped"]))
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetty-http-jars
+          path: ${{ runner.temp }}/out/*.jar
+          if-no-files-found: error
