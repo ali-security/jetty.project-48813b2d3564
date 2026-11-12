@@ -370,6 +370,29 @@ public class HttpParser
     }
     
     /* ------------------------------------------------------------------------------- */
+    private long convertContentLength(String valueString)
+    {
+        if (valueString==null || valueString.length()==0)
+            throw new BadMessageException(HttpStatus.BAD_REQUEST_400,"Bad Content-Length");
+
+        long value=0;
+        int length=valueString.length();
+
+        for (int i=0;i<length;i++)
+        {
+            char c=valueString.charAt(i);
+            if (c<'0' || c>'9')
+                throw new BadMessageException(HttpStatus.BAD_REQUEST_400,"Bad Content-Length");
+
+            int digit=c-'0';
+            if (value>(Long.MAX_VALUE-digit)/10)
+                throw new BadMessageException(HttpStatus.BAD_REQUEST_400,"Bad Content-Length");
+            value=value*10+digit;
+        }
+        return value;
+    }
+
+    /* ------------------------------------------------------------------------------- */
     private byte next(ByteBuffer buffer)
     {
         byte ch = buffer.get();
@@ -818,15 +841,7 @@ public class HttpParser
                 if (_endOfContent == EndOfContent.CHUNKED_CONTENT)
                     throw new BadMessageException(HttpStatus.BAD_REQUEST_400,"Bad Content-Length");
 
-                try
-                {
-                    _contentLength=Long.parseLong(_valueString);
-                }
-                catch(NumberFormatException e)
-                {
-                    LOG.ignore(e);
-                    throw new BadMessageException(HttpStatus.BAD_REQUEST_400,"Bad Content-Length");
-                }
+                _contentLength=convertContentLength(_valueString);
                 if (_contentLength <= 0)
                     _endOfContent=EndOfContent.NO_CONTENT;
                 else

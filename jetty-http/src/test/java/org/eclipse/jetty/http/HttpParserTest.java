@@ -1196,60 +1196,51 @@ public class HttpParserTest
     }
 
     @Test
-    public void testBadContentLength0() throws Exception
+    public void testBadContentLengths() throws Exception
     {
-        ByteBuffer buffer= BufferUtil.toBuffer(
-                "GET / HTTP/1.0\015\012"
-                        + "Content-Length: abc\015\012"
-                        + "Connection: close\015\012"
-                        + "\015\012");
+        String[] badLengths = {"abc", "1.5", "9999999999999999999999999999999999999999999999",
+            "9223372036854775808", "-10", "+10", "1.0", "1,0", "10,", "1 0", "0x10"};
+        for (String contentLength : badLengths)
+        {
+            _bad=null;
+            _messageCompleted=false;
+            ByteBuffer buffer= BufferUtil.toBuffer(
+                    "GET /test HTTP/1.1\015\012"
+                            + "Host: localhost\015\012"
+                            + "Content-Length: " + contentLength + "\015\012"
+                            + "\015\012"
+                            + "1234567890\015\012");
 
-        HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
-        HttpParser parser= new HttpParser(handler);
+            HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
+            HttpParser parser= new HttpParser(handler);
 
-        parser.parseNext(buffer);
-        assertEquals("GET",_methodOrVersion);
-        assertEquals("Bad Content-Length",_bad);
-        assertFalse(buffer.hasRemaining());
-        assertEquals(HttpParser.State.CLOSED,parser.getState());
+            parser.parseNext(buffer);
+            assertEquals("Content-Length: "+contentLength,"Bad Content-Length",_bad);
+            assertFalse("Content-Length: "+contentLength,_messageCompleted);
+            assertFalse(buffer.hasRemaining());
+            assertEquals(HttpParser.State.CLOSED,parser.getState());
+        }
     }
 
     @Test
-    public void testBadContentLength1() throws Exception
+    public void testGoodContentLengths() throws Exception
     {
-        ByteBuffer buffer= BufferUtil.toBuffer(
-                "GET / HTTP/1.0\015\012"
-                        + "Content-Length: 9999999999999999999999999999999999999999999999\015\012"
-                        + "Connection: close\015\012"
-                        + "\015\012");
+        String[] goodLengths = {"0", "10", "0010", "9223372036854775807"};
+        for (String contentLength : goodLengths)
+        {
+            _bad=null;
+            ByteBuffer buffer= BufferUtil.toBuffer(
+                    "POST /test HTTP/1.1\015\012"
+                            + "Host: localhost\015\012"
+                            + "Content-Length: " + contentLength + "\015\012"
+                            + "\015\012");
 
-        HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
-        HttpParser parser= new HttpParser(handler);
+            HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
+            HttpParser parser= new HttpParser(handler);
 
-        parser.parseNext(buffer);
-        assertEquals("GET",_methodOrVersion);
-        assertEquals("Bad Content-Length",_bad);
-        assertFalse(buffer.hasRemaining());
-        assertEquals(HttpParser.State.CLOSED,parser.getState());
-    }
-
-    @Test
-    public void testBadContentLength2() throws Exception
-    {
-        ByteBuffer buffer= BufferUtil.toBuffer(
-                "GET / HTTP/1.0\015\012"
-                        + "Content-Length: 1.5\015\012"
-                        + "Connection: close\015\012"
-                        + "\015\012");
-
-        HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
-        HttpParser parser= new HttpParser(handler);
-
-        parser.parseNext(buffer);
-        assertEquals("GET",_methodOrVersion);
-        assertEquals("Bad Content-Length",_bad);
-        assertFalse(buffer.hasRemaining());
-        assertEquals(HttpParser.State.CLOSED,parser.getState());
+            parser.parseNext(buffer);
+            assertEquals("Content-Length: "+contentLength,null,_bad);
+        }
     }
 
     @Test
