@@ -180,6 +180,32 @@ public class HttpParserTest
         assertEquals("HTTP/1.0", _versionOrReason);
         assertEquals(-1, _headers);
     }
+
+    @Test
+    public void testAllowedLinePreamble() throws Exception
+    {
+        ByteBuffer buffer= BufferUtil.toBuffer("\r\n\r\nGET / HTTP/1.0\r\n");
+
+        HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
+        HttpParser parser= new HttpParser(handler);
+        parseAll(parser,buffer);
+        assertEquals("GET", _methodOrVersion);
+        assertEquals("/", _uriOrStatus);
+        assertEquals("HTTP/1.0", _versionOrReason);
+        assertEquals(-1, _headers);
+    }
+    
+    @Test
+    public void testDisallowedLinePreamble() throws Exception
+    {
+        ByteBuffer buffer= BufferUtil.toBuffer("\r\n \r\nGET / HTTP/1.0\r\n");
+
+        HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
+        HttpParser parser= new HttpParser(handler);
+        parseAll(parser,buffer);
+        assertEquals("400", _bad);
+    }
+    
     
     @Test
     public void testConnect() throws Exception
@@ -453,7 +479,7 @@ public class HttpParserTest
         HttpParser parser= new HttpParser(handler);
         parseAll(parser,buffer);
         assertThat(_bad,Matchers.notNullValue());
-    } 
+    }
 
     @Test
     public void testHeaderTab() throws Exception
@@ -1225,7 +1251,166 @@ public class HttpParserTest
         assertFalse(buffer.hasRemaining());
         assertEquals(HttpParser.State.CLOSED,parser.getState());
     }
-    
+
+    @Test
+    public void testDuplicateContentLength() throws Exception
+    {
+        ByteBuffer buffer= BufferUtil.toBuffer(
+                "POST / HTTP/1.1\015\012"
+                        + "Host: localhost\015\012"
+                        + "Content-Length: 1\015\012"
+                        + "Content-Length: 2\015\012"
+                        + "\015\012"
+                        + "XY");
+
+        HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
+        HttpParser parser= new HttpParser(handler);
+
+        parser.parseNext(buffer);
+        assertEquals("Bad Content-Lengths",_bad);
+        assertFalse(_messageCompleted);
+        assertEquals(HttpParser.State.CLOSED,parser.getState());
+    }
+
+    @Test
+    public void testTransferEncodingChunkedThenContentLength() throws Exception
+    {
+        ByteBuffer buffer= BufferUtil.toBuffer(
+                "POST /chunk HTTP/1.1\015\012"
+                        + "Host: localhost\015\012"
+                        + "Transfer-Encoding: chunked\015\012"
+                        + "Content-Length: 1\015\012"
+                        + "\015\012"
+                        + "1\015\012"
+                        + "X\015\012"
+                        + "0\015\012"
+                        + "\015\012");
+
+        HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
+        HttpParser parser= new HttpParser(handler);
+
+        parser.parseNext(buffer);
+        assertEquals("Bad Content-Length",_bad);
+        assertFalse(_messageCompleted);
+        assertEquals(HttpParser.State.CLOSED,parser.getState());
+    }
+
+    @Test
+    public void testContentLengthThenTransferEncodingChunked() throws Exception
+    {
+        ByteBuffer buffer= BufferUtil.toBuffer(
+                "POST /chunk HTTP/1.1\015\012"
+                        + "Host: localhost\015\012"
+                        + "Content-Length: 1\015\012"
+                        + "Transfer-Encoding: chunked\015\012"
+                        + "\015\012"
+                        + "1\015\012"
+                        + "X\015\012"
+                        + "0\015\012"
+                        + "\015\012");
+
+        HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
+        HttpParser parser= new HttpParser(handler);
+
+        parser.parseNext(buffer);
+        assertEquals("Bad chunking",_bad);
+        assertFalse(_messageCompleted);
+        assertEquals(HttpParser.State.CLOSED,parser.getState());
+    }
+
+    @Test
+    public void testChunkLengthOverflow() throws Exception
+    {
+        // 0x10000000F would overflow the int chunk length to a small value (15)
+        ByteBuffer buffer= BufferUtil.toBuffer(
+                "POST /chunk HTTP/1.1\015\012"
+                        + "Host: localhost\015\012"
+                        + "Transfer-Encoding: chunked\015\012"
+                        + "\015\012"
+                        + "10000000F\015\012"
+                        + "0123456789ABCDE\015\012"
+                        + "0\015\012"
+                        + "\015\012");
+
+        HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
+        HttpParser parser= new HttpParser(handler);
+
+        parseAll(parser,buffer);
+        assertEquals("413",_bad);
+        assertNull(_content);
+        assertFalse(_messageCompleted);
+    }
+
+    @Test
+    public void testLargeValidChunkLength() throws Exception
+    {
+        // A chunk length at the limit is still accepted (only its header is parsed here)
+        ByteBuffer buffer= BufferUtil.toBuffer(
+                "POST /chunk HTTP/1.1\015\012"
+                        + "Host: localhost\015\012"
+                        + "Transfer-Encoding: chunked\015\012"
+                        + "\015\012"
+                        + "7FFFFEF\015\012"
+                        + "0123456789");
+
+        HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
+        HttpParser parser= new HttpParser(handler);
+
+        parser.parseNext(buffer);
+        assertNull(_bad);
+        assertEquals("0123456789",_content);
+    }
+
+    @Test
+    public void testBadRequestVersions() throws Exception
+    {
+        String[] versions = {"HTTP/0.9","HTTP/2.0"};
+        for (String version : versions)
+        {
+            String request="GET / "+version+"\015\012Host: localhost\015\012\015\012";
+
+            // whole request in one buffer (look-ahead version parsing)
+            init();
+            HttpParser parser= new HttpParser((HttpParser.RequestHandler<ByteBuffer>)new Handler());
+            parser.parseNext(BufferUtil.toBuffer(request));
+            assertEquals(version,"Bad Version",_bad);
+            assertFalse(version,_headerCompleted);
+
+            // request fed byte by byte (REQUEST_VERSION state parsing)
+            init();
+            parser= new HttpParser((HttpParser.RequestHandler<ByteBuffer>)new Handler());
+            for (int i=0;i<request.length() && _bad==null;i++)
+                parser.parseNext(BufferUtil.toBuffer(request.substring(i,i+1)));
+            assertEquals(version,"Bad Version",_bad);
+            assertFalse(version,_headerCompleted);
+        }
+    }
+
+    @Test
+    public void testGoodRequestVersions() throws Exception
+    {
+        String[] versions = {"HTTP/1.0","HTTP/1.1"};
+        for (String version : versions)
+        {
+            String request="GET / "+version+"\015\012Host: localhost\015\012\015\012";
+
+            init();
+            HttpParser parser= new HttpParser((HttpParser.RequestHandler<ByteBuffer>)new Handler());
+            parser.parseNext(BufferUtil.toBuffer(request));
+            assertNull(version,_bad);
+            assertEquals(version,_versionOrReason);
+            assertTrue(version,_messageCompleted);
+
+            init();
+            parser= new HttpParser((HttpParser.RequestHandler<ByteBuffer>)new Handler());
+            for (int i=0;i<request.length();i++)
+                parser.parseNext(BufferUtil.toBuffer(request.substring(i,i+1)));
+            assertNull(version,_bad);
+            assertEquals(version,_versionOrReason);
+            assertTrue(version,_messageCompleted);
+        }
+    }
+
     @Test
     public void testHost() throws Exception
     {
@@ -1545,13 +1730,7 @@ public class HttpParserTest
         HttpParser parser= new HttpParser(handler);
         parseAll(parser,buffer);
 
-        assertTrue(_headerCompleted);
-        assertTrue(_messageCompleted);
-        assertEquals("PRI", _methodOrVersion);
-        assertEquals("*", _uriOrStatus);
-        assertEquals("HTTP/2.0", _versionOrReason);
-        assertEquals(-1, _headers);
-        assertEquals(null, _bad);
+        assertEquals("Bad Version", _bad);
     }
 
     @Before
